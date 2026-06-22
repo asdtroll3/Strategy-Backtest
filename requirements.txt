@@ -1,0 +1,4 @@
+# Python 3.10+ recommended
+pandas>=2.2
+numpy>=1.26
+plotly>=5.18
