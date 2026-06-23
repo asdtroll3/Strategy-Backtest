@@ -42,10 +42,14 @@ A4.  RTH SESSION = [rth_start, rth_end) = [09:30, 16:00) NY (standard cash
      session).  NOTE: earlier in this project you used a custom 09:30–15:30
      window — set `rth_end = time(15, 30)` to reproduce that.
 
-A5.  "RTH 1-hour candle" (used ONLY for level invalidation): a 1-hour candle
-     that *overlaps* the RTH window.  With clock-hour bars that is the 09:00–
-     15:00 NY candles (the 09:00 bar contains the open).  Bias-flip *creation*
-     uses ALL 1-hour candles (24h), per the spec wording.
+A5.  LEVELS LIVE ON THE RTH-ANCHORED 1-HOUR CANDLES (NQ_1Hour_RTH.csv): the
+     session bars anchored to the 09:30 open (09:30, 10:30, … each day).  BOTH
+     bias-flip creation and invalidation use this RTH series — a level is the
+     OPEN of an RTH hourly candle that flips direction, and it dies when a later
+     RTH hourly candle's BODY closes through it: open/close straddle (or pass)
+     the level in EITHER direction (bull dies on min(open,close)<level, bear on
+     max(open,close)>level); wicks alone don't count.  (Earlier versions detected
+     on the 24h clock-hour file and used a one-sided close rule.)
 
 A6.  "Current price" for the trend / above-open checks = the close of the 5-min
      candle being evaluated (the reaction candle).
@@ -108,7 +112,7 @@ A19. OPENING-RANGE FILTER.  When `skip_first_30min` is True, no ENTRY may occur
 from __future__ import annotations
 
 import bisect
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import time
 from pathlib import Path
 
@@ -127,6 +131,7 @@ class Config:
     # --- data ---
     file_1h: Path = BASE_DIR / "NQ_1Hour.csv"
     file_5m: Path = BASE_DIR / "NQ_5Min.csv"
+    file_1h_rth: Path = BASE_DIR / "NQ_1Hour_RTH.csv"  # RTH-only hourly, for level charting
     source_tz: str = "America/Chicago"           # A1
     target_tz: str = "America/New_York"
     date_format: str = "%m/%d/%Y %I:%M %p"        # CSV date format
@@ -158,7 +163,7 @@ class Config:
     trade_log_csv: Path = BASE_DIR / "trade_log.csv"
     show_plots: bool = True                       # open Plotly figures in browser
     plot_equity: bool = True                      # include the equity-curve figure
-    plot_trade_indices: tuple = (5,)              # which trade rows to chart (CSV row numbers)
+    plot_trade_indices: tuple = (251,252,253,254)              # which trade rows to chart (CSV row numbers)
     max_charts: int = 20                          # safety cap on how many trade tabs to open
 
 
@@ -241,12 +246,15 @@ def compute_invalidations(df_1h: pd.DataFrame, levels: pd.DataFrame,
                           cfg: Config) -> pd.DataFrame:
     """Stamp each level with `invalidated_at` (NY Timestamp or NaT).
 
-    A level dies the moment an *RTH* 1-hour candle CLOSES through it (body, not
-    wick): bull dies on close < level, bear dies on close > level.  We sweep all
-    1-hour candles in time order, maintaining the active bull/bear levels sorted
-    by price; each RTH close invalidates the whole block of levels beyond it in
-    O(block) and we record the candle's CLOSE time as the invalidation time.
+    A level dies the moment an *RTH* 1-hour candle's BODY trades through it — the
+    open/close straddle (or fully pass) the level, in either direction; wicks
+    don't count.  Concretely: a bull level dies when min(open, close) < level, a
+    bear level dies when max(open, close) > level.  We sweep all 1-hour candles
+    in time order, maintaining the active bull/bear levels sorted by price; each
+    candle kills the whole block of levels its body reaches, and we record the
+    candle's CLOSE time as the invalidation time.
     """
+    o = df_1h["open"].to_numpy()
     c = df_1h["close"].to_numpy()
     index = df_1h.index
     step = index[1] - index[0] if len(index) > 1 else pd.Timedelta(hours=1)
@@ -269,15 +277,15 @@ def compute_invalidations(df_1h: pd.DataFrame, levels: pd.DataFrame,
 
     for i in range(len(df_1h)):
         if is_rth[i]:
-            x = c[i]
-            # Bull levels with price > close are invalidated (suffix of bull_p).
-            cut = bisect.bisect_right(bull_p, x)
+            lo, hi = (o[i], c[i]) if o[i] <= c[i] else (c[i], o[i])   # candle BODY span
+            # Bull levels the body reached BELOW (price > body low) are invalidated.
+            cut = bisect.bisect_right(bull_p, lo)
             for k in range(cut, len(bull_p)):
                 invalidated_at[bull_id[k]] = close_times[i]
             del bull_p[cut:]
             del bull_id[cut:]
-            # Bear levels with price < close are invalidated (prefix of bear_p).
-            cut = bisect.bisect_left(bear_p, x)
+            # Bear levels the body reached ABOVE (price < body high) are invalidated.
+            cut = bisect.bisect_left(bear_p, hi)
             for k in range(cut):
                 invalidated_at[bear_id[k]] = close_times[i]
             del bear_p[:cut]
@@ -551,37 +559,181 @@ def plot_equity_curve(trades: pd.DataFrame):
     return fig
 
 
-def plot_trade(trades: pd.DataFrame, idx: int, df_5m: pd.DataFrame, cfg: Config):
-    """Plot one trade: that day's 5-min candles + level, entry, stop, target."""
+def plot_trade(trades: pd.DataFrame, idx: int, df_5m: pd.DataFrame, cfg: Config,
+               levels: pd.DataFrame | None = None):
+    """Two-panel chart for one trade (panels share the price axis, so levels
+    line up across both):
+      LEFT  = previous trading day's 1-hour RTH candles + the active bias-flip
+              levels (bullish blue, bearish red, the traded level gold).
+      RIGHT = the trade day's 5-minute candles + level / entry / stop / target.
+    Pass `levels` (from the backtest) to draw the bias-flip lines on the left;
+    if `levels` is None or there is no prior session, only the 5-min panel shows.
+    """
     import plotly.graph_objects as go
+    from plotly.subplots import make_subplots
+
     tr = trades.iloc[idx]
-    day = df_5m[df_5m.index.normalize() == pd.Timestamp(tr["Date"], tz=cfg.target_tz)]
-    mod = minutes_of_day(day.index)
+    tz = cfg.target_tz
     rs = cfg.rth_start.hour * 60 + cfg.rth_start.minute
     re = cfg.rth_end.hour * 60 + cfg.rth_end.minute
-    day = day[(mod >= rs) & (mod < re)]
 
-    fig = go.Figure(go.Candlestick(
+    def rth_slice(frame):
+        m = minutes_of_day(frame.index)
+        return frame[(m >= rs) & (m < re)]
+
+    # --- trade day 5-min (RTH) ---
+    trade_date = pd.Timestamp(tr["Date"], tz=tz)
+    day = rth_slice(df_5m[df_5m.index.normalize() == trade_date])
+
+    # --- previous trading day's RTH 1-hour candles (resampled from 5m) ---
+    rmask = (minutes_of_day(df_5m.index) >= rs) & (minutes_of_day(df_5m.index) < re)
+    sess_dates = df_5m.index[rmask].normalize().unique()
+    earlier = sess_dates[sess_dates < trade_date]
+    prev_date = earlier.max() if len(earlier) else None
+
+    prev_1h = None
+    if prev_date is not None:
+        p = rth_slice(df_5m[df_5m.index.normalize() == prev_date])
+        if not p.empty:
+            off = pd.Timedelta(minutes=cfg.rth_start.minute)   # anchor buckets to the open
+            bucket = (p.index - off).floor("h") + off
+            prev_1h = p.groupby(bucket).agg(
+                open=("open", "first"), high=("high", "max"),
+                low=("low", "min"), close=("close", "last"))
+
+    has_left = prev_1h is not None and not prev_1h.empty
+    if has_left:
+        fig = make_subplots(
+            rows=1, cols=2, shared_yaxes=True, column_widths=[0.32, 0.68],
+            horizontal_spacing=0.015,
+            subplot_titles=(f"Prev day {prev_date.date()} — 1H RTH",
+                            f"Trade day {trade_date.date()} — 5M"))
+        rcol = 2
+    else:
+        fig = make_subplots(rows=1, cols=1,
+                            subplot_titles=(f"Trade day {trade_date.date()} — 5M",))
+        rcol = 1
+
+    # ---- LEFT: prev-day 1H RTH candles + bias-flip levels ----
+    if has_left:
+        fig.add_trace(go.Candlestick(
+            x=prev_1h.index, open=prev_1h["open"], high=prev_1h["high"],
+            low=prev_1h["low"], close=prev_1h["close"], showlegend=False),
+            row=1, col=1)
+        if levels is not None and not levels.empty:
+            ymin = float(min(prev_1h["low"].min(), day["low"].min()))
+            ymax = float(max(prev_1h["high"].max(), day["high"].max()))
+            open_ts = trade_date + pd.Timedelta(minutes=rs)    # trade-day 9:30 open
+            active = levels[(levels["created_time"] < open_ts)
+                            & (levels["price"].between(ymin, ymax))
+                            & (levels["invalidated_at"].isna()
+                               | (levels["invalidated_at"] > open_ts))]
+            for _, lv in active.iterrows():
+                used = abs(lv["price"] - tr["Level Used"]) < 0.01
+                fig.add_hline(
+                    y=lv["price"], row=1, col=1,
+                    line=dict(width=2 if used else 1,
+                              dash="solid" if used else "dot",
+                              color="#f0c040" if used else
+                                    "#42a5f5" if lv["type"] == "bull" else "#ef9a9a"))
+
+    # ---- RIGHT: trade-day 5-min candles + level / entry / stop / target ----
+    fig.add_trace(go.Candlestick(
         x=day.index, open=day["open"], high=day["high"],
-        low=day["low"], close=day["close"], name="5m"))
+        low=day["low"], close=day["close"], showlegend=False), row=1, col=rcol)
     for price, color, label in [
-        (tr["Level Used"], "#42a5f5", "Bias Flip Level"),
+        (tr["Level Used"], "#f0c040", "Level"),
         (tr["Entry Price"], "#26a69a", "Entry"),
         (tr["Stop Price"], "#ef5350", "Stop"),
         (tr["Target Price"], "#ab47bc", "Target"),
     ]:
-        fig.add_hline(y=price, line=dict(color=color, dash="dot"),
+        fig.add_hline(y=price, row=1, col=rcol, line=dict(color=color, dash="dot"),
                       annotation_text=label, annotation_position="right")
-    fig.add_trace(go.Scatter(x=[tr["Entry Time"]], y=[tr["Entry Price"]],
-                             mode="markers", name="Entry",
-                             marker=dict(color="#26a69a", size=11, symbol="triangle-up")))
-    fig.add_trace(go.Scatter(x=[tr["Exit Time"]], y=[tr["Exit Price"]],
-                             mode="markers", name="Exit",
-                             marker=dict(color="#ffffff", size=11, symbol="x")))
-    fig.update_layout(height=650, template="plotly_dark",
-                      xaxis_rangeslider_visible=False,
-                      title=f"Trade {idx}  {tr['Date']}  {tr['Result']}  "
-                            f"{tr['R Multiple']}R")
+    fig.add_trace(go.Scatter(
+        x=[tr["Entry Time"]], y=[tr["Entry Price"]], mode="markers", name="Entry",
+        marker=dict(color="#26a69a", size=11, symbol="triangle-up")), row=1, col=rcol)
+    fig.add_trace(go.Scatter(
+        x=[tr["Exit Time"]], y=[tr["Exit Price"]], mode="markers", name="Exit",
+        marker=dict(color="#ffffff", size=11, symbol="x")), row=1, col=rcol)
+
+    fig.update_xaxes(rangeslider_visible=False)
+    fig.update_layout(height=650, template="plotly_dark", showlegend=False,
+                      title=f"Trade {idx}  {tr['Date']}  {tr['Result']}  {tr['R Multiple']}R")
+    return fig
+
+
+def plot_rth_levels(df_1h_rth: pd.DataFrame, levels: pd.DataFrame, cfg: Config,
+                    start, end, only_active: bool = True, include_older: bool = False):
+    """Plot the NQ_1Hour_RTH candles between `start` and `end` (date-like,
+    inclusive) with the bias-flip levels that are in play over that range.
+
+    Candles come straight from the RTH 1-hour file (no resampling) and are drawn
+    on a real datetime axis, so overnight/weekend ETH periods show up as gaps —
+    like a session-only series.
+
+    "Active" means still valid at the END of the requested range: a level
+    invalidated by a close on the last day (e.g. a 15:00 spike) counts as
+    invalidated, even though that happens after the last drawn bar's start.
+
+    By DEFAULT only the surviving (active) levels are drawn — solid and
+    price-labelled.  Pass `only_active=False` to also show the invalidated ones
+    (faded/dotted, stopping where they died).  Bullish = blue, bearish = red.
+
+    Also by default only levels that FORMED within the window are shown; pass
+    `include_older=True` to also draw older levels that are still active (they
+    persist and the backtest still uses them — they're just hidden here to keep
+    the in-range verification clean).
+    """
+    import plotly.graph_objects as go
+
+    tz = cfg.target_tz
+    win_start = pd.Timestamp(start, tz=tz)
+    win_end = pd.Timestamp(end, tz=tz) + pd.Timedelta(days=1)        # inclusive end day
+    bars = df_1h_rth[(df_1h_rth.index >= win_start) & (df_1h_rth.index < win_end)]
+    if bars.empty:
+        raise ValueError(f"No RTH 1-hour candles between {start} and {end} "
+                         f"(check the dates / that NQ_1Hour_RTH.csv covers them)")
+
+    t0, t1 = bars.index[0], bars.index[-1]
+    fig = go.Figure(go.Candlestick(
+        x=bars.index, open=bars["open"], high=bars["high"], low=bars["low"],
+        close=bars["close"], name="1H RTH", showlegend=False))
+
+    # --- bias-flip levels as creation -> invalidation rays, clamped to window ---
+    ymin, ymax = float(bars["low"].min()), float(bars["high"].max())
+    vis = levels[(levels["price"] >= ymin) & (levels["price"] <= ymax)]
+    if not include_older:                       # only levels that FORMED in the window
+        vis = vis[vis["created_time"] >= win_start]
+    n_drawn = 0
+    for _, lv in vis.iterrows():
+        ct, iv = lv["created_time"], lv["invalidated_at"]
+        if ct > t1:                                                 # created after window
+            continue
+        if pd.notna(iv) and iv <= t0:                               # died before window
+            continue
+        active = pd.isna(iv) or iv >= win_end   # survives to the END of the range (not just t1)
+        if only_active and not active:
+            continue
+        x_start = max(ct, t0)                                       # clamp ray into view
+        x_end = t1 if active else min(iv, t1)
+        if x_end < x_start:
+            x_end = x_start
+        color = "#42a5f5" if lv["type"] == "bull" else "#ef5350"
+        fig.add_trace(go.Scatter(
+            x=[x_start, x_end], y=[lv["price"], lv["price"]], mode="lines",
+            line=dict(color=color, width=1.4, dash="solid" if active else "dot"),
+            opacity=1.0 if active else 0.45, showlegend=False,
+            hovertemplate=f"{lv['type']} {lv['price']:.2f}<extra></extra>"))
+        if active:                                                  # label price at right edge
+            fig.add_annotation(x=x_end, y=lv["price"], text=f"  {lv['price']:.2f}",
+                               xanchor="left", yanchor="middle", showarrow=False,
+                               font=dict(size=9, color=color))
+        n_drawn += 1
+
+    fig.update_xaxes(rangeslider_visible=False)
+    fig.update_layout(height=700, template="plotly_dark", showlegend=False,
+                      title=f"1H RTH bias-flip levels  {t0.date()} .. {t1.date()}  "
+                            f"({n_drawn} levels)")
     return fig
 
 
@@ -608,8 +760,25 @@ def show_trade(idx: int, cfg: Config | None = None):
     """
     cfg = cfg or Config()
     trades = pd.read_csv(cfg.trade_log_csv)
+    for col in ("Entry Time", "Exit Time"):            # restore tz-aware (NY) times
+        trades[col] = pd.to_datetime(trades[col], utc=True).dt.tz_convert(cfg.target_tz)
+    df_1h = load_ohlc(cfg.file_1h, cfg)
+    levels = compute_invalidations(df_1h, detect_bias_flips(df_1h), cfg)
     df_5m = load_ohlc(cfg.file_5m, cfg)
-    plot_trade(trades, idx, df_5m, cfg).show()
+    plot_trade(trades, idx, df_5m, cfg, levels=levels).show()
+
+
+def show_levels(start, end, cfg: Config | None = None, only_active: bool = True,
+                include_older: bool = False):
+    """Convenience: load full history, detect levels, and show the 1H RTH levels
+    chart for a date range.  Example:  show_levels("2025-05-21", "2025-06-24")
+    Loads the whole file (ignoring the Config year window) so level creation /
+    invalidation history is complete; only the requested range is drawn.
+    """
+    cfg = replace(cfg or Config(), start_year=None, end_year=None)
+    df_1h_rth = load_ohlc(cfg.file_1h_rth, cfg)
+    levels = compute_invalidations(df_1h_rth, detect_bias_flips(df_1h_rth), cfg)
+    plot_rth_levels(df_1h_rth, levels, cfg, start, end, only_active, include_older).show()
 
 
 # ============================================================================
@@ -620,17 +789,17 @@ def main(cfg: Config | None = None, plot_args=None) -> pd.DataFrame:
 
     yr = f"  [year window: {cfg.start_year or 'start'}..{cfg.end_year or 'end'}]"
     print("Loading data ..." + (yr if (cfg.start_year or cfg.end_year) else ""))
-    df_1h = load_ohlc(cfg.file_1h, cfg)
+    df_1h_rth = load_ohlc(cfg.file_1h_rth, cfg)   # levels live on the RTH-anchored 1H candles
     df_5m = load_ohlc(cfg.file_5m, cfg)
-    if df_5m.empty or df_1h.empty:
+    if df_5m.empty or df_1h_rth.empty:
         raise SystemExit(f"No data in year window "
                          f"{cfg.start_year}..{cfg.end_year}; check start_year/end_year.")
-    print(f"  1H bars: {len(df_1h):,}   5M bars: {len(df_5m):,}   "
+    print(f"  1H RTH bars: {len(df_1h_rth):,}   5M bars: {len(df_5m):,}   "
           f"range {df_5m.index[0].date()} .. {df_5m.index[-1].date()}")
 
-    print("Detecting bias-flip levels ...")
-    levels = detect_bias_flips(df_1h)
-    levels = compute_invalidations(df_1h, levels, cfg)
+    print("Detecting bias-flip levels (RTH 1H) ...")
+    levels = detect_bias_flips(df_1h_rth)
+    levels = compute_invalidations(df_1h_rth, levels, cfg)
     n_bull = int((levels["type"] == "bull").sum())
     n_live = int(levels["invalidated_at"].isna().sum())
     print(f"  {len(levels):,} levels ({n_bull:,} bullish); {n_live:,} still active at end")
@@ -663,13 +832,26 @@ def main(cfg: Config | None = None, plot_args=None) -> pd.DataFrame:
             indices = indices[:cfg.max_charts]
         print(f"  charting trade rows: {indices}")
         for i in indices:
-            plot_trade(trades, i, df_5m, cfg).show()
+            plot_trade(trades, i, df_5m, cfg, levels=levels).show()
 
     return trades
 
 
 if __name__ == "__main__":
     import sys
-    # No args -> uses Config.plot_trade_indices. Otherwise e.g.:
-    #   python Backtest.py 5 12 30-34 -1      python Backtest.py all
-    main(plot_args=sys.argv[1:])
+    args = sys.argv[1:]
+    if args and args[0] == "levels":
+        # 1H RTH levels for a date range. By default: active levels that FORMED
+        # in the range. Optional flags (any order): 'all' also shows invalidated,
+        # 'older' also shows still-active levels created before the range.
+        #   python Backtest.py levels 2025-12-05 2025-12-10
+        #   python Backtest.py levels 2025-12-05 2025-12-10 all older
+        if len(args) < 3:
+            raise SystemExit("usage: python Backtest.py levels <start> <end> [all] [older]")
+        flags = {a.lower() for a in args[3:]}
+        show_levels(args[1], args[2], only_active=not ("all" in flags),
+                    include_older=("older" in flags))
+    else:
+        # No args -> uses Config.plot_trade_indices. Otherwise trade rows, e.g.:
+        #   python Backtest.py 5 12 30-34 -1      python Backtest.py all
+        main(plot_args=args)
