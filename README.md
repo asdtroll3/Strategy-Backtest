@@ -45,14 +45,6 @@ Date;Symbol;Open;High;Low;Close;Volume
 If your data is in a different timezone/format, adjust `load_ohlc` and the `Config`
 fields at the top of `Backtest.py`.
 
-## Setup
-
-```bash
-python -m venv .venv
-.venv\Scripts\activate          # Windows  (use: source .venv/bin/activate on macOS/Linux)
-pip install -r requirements.txt
-```
-
 ## Usage
 
 ```bash
