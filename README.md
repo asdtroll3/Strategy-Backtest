@@ -20,6 +20,11 @@ framework) so the logic stays auditable and easy to modify.
 | `Convert_Data.py` | Resamples a 5-minute CSV into 1-hour and RTH-only 1-hour CSVs. |
 | `DrawDay.py` | Plots a single day of candles (5-min / 1-hour) with VWAP and volume. |
 
+## Requirements
+
+- Python 3.9+ (developed on 3.14)
+- `pip install pandas numpy plotly`
+
 ## Data is not included
 
 The market-data CSVs are **not** part of this repository (they're git-ignored).
